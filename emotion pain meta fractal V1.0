@@ -1,0 +1,505 @@
+# =============================================================================
+#  Copyright (C) 2026  Darrell Lee (Līlā) Stiltner
+#
+#  This program is free software: you can redistribute it and/or modify
+#  it under the terms of the GNU General Public License as published by
+#  the Free Software Foundation, either version 3 of the License, or
+#  (at your option) any later version.
+#
+#  This program is distributed in the hope that it will be useful,
+#  but WITHOUT ANY WARRANTY; without even the implied warranty of
+#  MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+#  GNU General Public License for more details.
+#
+#  You should have received a copy of the GNU General Public License
+#  along with this program.  If not, see <https://www.gnu.org/licenses/>.
+# =============================================================================
+#!/usr/bin/env python3
+"""
+Pain Fractal Platform – Monolithic, No-Bloat, Full Stack
+
+Includes:
+- Kernel + instability dynamics
+- Presets system
+- Single render
+- Batch render (parameter sweeps)
+- Simple animation (parameter morph)
+- Color system (palettes + modes)
+- JSON config import/export
+- Minimal API functions
+- CLI with subcommands
+
+Requires:
+- numpy
+- matplotlib (for rendering/animation)
+"""
+
+from __future__ import annotations
+import argparse
+import json
+import os
+from dataclasses import dataclass, asdict
+from typing import Tuple, Optional, Dict, Any, List, Callable
+
+import numpy as np
+
+try:
+    import matplotlib.pyplot as plt
+    from matplotlib import animation
+except ImportError:
+    plt = None
+    animation = None
+
+
+# =========================
+# Config structures
+# =========================
+
+@dataclass
+class KernelConfig:
+    inner_radius: float = 0.3
+    outer_radius: float = 1.6
+    gain_core: float = 3.2
+    gain_ring: float = 1.7
+    damping_outer: float = 0.82
+    nonlinearity: float = 2.1
+    steps: int = 80
+    escape_radius: float = 5.0
+
+
+@dataclass
+class RenderConfig:
+    width: int = 800
+    height: int = 800
+    x_min: float = -2.0
+    x_max: float = 2.0
+    y_min: float = -2.0
+    y_max: float = 2.0
+    cmap: str = "magma"
+    invert_y: bool = True
+    normalize: bool = True
+
+
+@dataclass
+class PlatformConfig:
+    kernel: KernelConfig
+    render: RenderConfig
+
+    @staticmethod
+    def default() -> "PlatformConfig":
+        return PlatformConfig(kernel=KernelConfig(), render=RenderConfig())
+
+    @staticmethod
+    def from_json(path: str) -> "PlatformConfig":
+        with open(path, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        k = KernelConfig(**data["kernel"])
+        r = RenderConfig(**data["render"])
+        return PlatformConfig(kernel=k, render=r)
+
+    def to_json(self, path: str) -> None:
+        data = {
+            "kernel": asdict(self.kernel),
+            "render": asdict(self.render),
+        }
+        with open(path, "w", encoding="utf-8") as f:
+            json.dump(data, f, indent=2)
+
+
+# =========================
+# Presets
+# =========================
+
+PRESETS: Dict[str, PlatformConfig] = {
+    "default": PlatformConfig.default(),
+    "high-instability": PlatformConfig(
+        kernel=KernelConfig(
+            inner_radius=0.25,
+            outer_radius=1.4,
+            gain_core=3.8,
+            gain_ring=2.0,
+            damping_outer=0.78,
+            nonlinearity=2.2,
+            steps=100,
+            escape_radius=6.0,
+        ),
+        render=RenderConfig(
+            width=900,
+            height=900,
+            x_min=-2.2,
+            x_max=2.2,
+            y_min=-2.2,
+            y_max=2.2,
+            cmap="inferno",
+            invert_y=True,
+            normalize=True,
+        ),
+    ),
+    "soft-basin": PlatformConfig(
+        kernel=KernelConfig(
+            inner_radius=0.4,
+            outer_radius=1.8,
+            gain_core=2.6,
+            gain_ring=1.4,
+            damping_outer=0.9,
+            nonlinearity=1.9,
+            steps=70,
+            escape_radius=4.5,
+        ),
+        render=RenderConfig(
+            width=800,
+            height=800,
+            x_min=-2.0,
+            x_max=2.0,
+            y_min=-2.0,
+            y_max=2.0,
+            cmap="plasma",
+            invert_y=True,
+            normalize=True,
+        ),
+    ),
+}
+
+
+# =========================
+# Kernel engine
+# =========================
+
+class PainFractalEngine:
+    def __init__(self, cfg: KernelConfig):
+        self.cfg = cfg
+
+    def _region_gain(self, r: float) -> float:
+        c = self.cfg
+        if r < c.inner_radius:
+            return c.gain_core
+        elif r < c.outer_radius:
+            return c.gain_ring
+        else:
+            return c.damping_outer
+
+    def _map(self, z: np.ndarray) -> np.ndarray:
+        c = self.cfg
+        x, y = z
+        r = np.sqrt(x * x + y * y) + 1e-12
+        theta = np.arctan2(y, x)
+
+        gain = self._region_gain(r)
+        r_new = gain * (r ** c.nonlinearity)
+        theta_new = theta + 0.35 + 0.15 * np.sin(3.0 * theta)
+
+        return np.array(
+            [r_new * np.cos(theta_new), r_new * np.sin(theta_new)],
+            dtype=np.float64,
+        )
+
+    def iterate_point(self, x: float, y: float, max_steps: Optional[int] = None) -> int:
+        c = self.cfg
+        max_steps = max_steps or c.steps
+        z = np.array([x, y], dtype=np.float64)
+
+        for i in range(max_steps):
+            z = self._map(z)
+            if np.linalg.norm(z) > c.escape_radius:
+                return i
+        return max_steps
+
+    def sample_field(self, rcfg: RenderConfig) -> np.ndarray:
+        c = self.cfg
+        xs = np.linspace(rcfg.x_min, rcfg.x_max, rcfg.width)
+        ys = np.linspace(rcfg.y_min, rcfg.y_max, rcfg.height)
+
+        field = np.zeros((rcfg.height, rcfg.width), dtype=np.float32)
+        for j, y in enumerate(ys):
+            for i, x in enumerate(xs):
+                field[j, i] = self.iterate_point(x, y, c.steps)
+        return field
+
+
+# =========================
+# Color + normalization
+# =========================
+
+def normalize_field(field: np.ndarray) -> np.ndarray:
+    f = field.astype(np.float32)
+    mn, mx = f.min(), f.max()
+    if mx <= mn:
+        return np.zeros_like(f)
+    return (f - mn) / (mx - mn)
+
+
+# =========================
+# Rendering
+# =========================
+
+def render_field_to_figure(
+    field: np.ndarray,
+    rcfg: RenderConfig,
+) -> Any:
+    if plt is None:
+        raise RuntimeError("matplotlib is required for rendering")
+
+    img = field.copy()
+    if rcfg.normalize:
+        img = normalize_field(img)
+    if rcfg.invert_y:
+        img = img[::-1, :]
+
+    fig = plt.figure(figsize=(6, 6))
+    ax = plt.axes([0, 0, 1, 1])
+    ax.axis("off")
+    im = ax.imshow(img, cmap=rcfg.cmap, interpolation="bilinear")
+    return fig, ax, im
+
+
+def save_field_image(
+    field: np.ndarray,
+    rcfg: RenderConfig,
+    out_path: str,
+) -> None:
+    fig, _, _ = render_field_to_figure(field, rcfg)
+    os.makedirs(os.path.dirname(out_path) or ".", exist_ok=True)
+    fig.savefig(out_path, bbox_inches="tight", pad_inches=0, dpi=300)
+    plt.close(fig)
+
+
+def show_field(field: np.ndarray, rcfg: RenderConfig) -> None:
+    fig, _, _ = render_field_to_figure(field, rcfg)
+    plt.show()
+    plt.close(fig)
+
+
+# =========================
+# Animation
+# =========================
+
+def interpolate_kernel(a: KernelConfig, b: KernelConfig, t: float) -> KernelConfig:
+    def lerp(x, y): return (1.0 - t) * x + t * y
+
+    return KernelConfig(
+        inner_radius=lerp(a.inner_radius, b.inner_radius),
+        outer_radius=lerp(a.outer_radius, b.outer_radius),
+        gain_core=lerp(a.gain_core, b.gain_core),
+        gain_ring=lerp(a.gain_ring, b.gain_ring),
+        damping_outer=lerp(a.damping_outer, b.damping_outer),
+        nonlinearity=lerp(a.nonlinearity, b.nonlinearity),
+        steps=int(lerp(a.steps, b.steps)),
+        escape_radius=lerp(a.escape_radius, b.escape_radius),
+    )
+
+
+def animate_transition(
+    cfg_a: PlatformConfig,
+    cfg_b: PlatformConfig,
+    frames: int,
+    out_path: str,
+) -> None:
+    if plt is None or animation is None:
+        raise RuntimeError("matplotlib with animation is required")
+
+    rcfg = cfg_a.render
+    xs = np.linspace(rcfg.x_min, rcfg.x_max, rcfg.width)
+    ys = np.linspace(rcfg.y_min, rcfg.y_max, rcfg.height)
+
+    fig = plt.figure(figsize=(6, 6))
+    ax = plt.axes([0, 0, 1, 1])
+    ax.axis("off")
+    img = np.zeros((rcfg.height, rcfg.width), dtype=np.float32)
+    im = ax.imshow(img, cmap=rcfg.cmap, interpolation="bilinear")
+
+    def frame_func(frame_idx: int):
+        t = frame_idx / max(frames - 1, 1)
+        kcfg = interpolate_kernel(cfg_a.kernel, cfg_b.kernel, t)
+        engine = PainFractalEngine(kcfg)
+        field = np.zeros_like(img)
+        for j, y in enumerate(ys):
+            for i, x in enumerate(xs):
+                field[j, i] = engine.iterate_point(x, y, kcfg.steps)
+        if rcfg.normalize:
+            field_n = normalize_field(field)
+        else:
+            field_n = field
+        if rcfg.invert_y:
+            field_n = field_n[::-1, :]
+        im.set_array(field_n)
+        return [im]
+
+    anim = animation.FuncAnimation(
+        fig, frame_func, frames=frames, interval=50, blit=True
+    )
+    os.makedirs(os.path.dirname(out_path) or ".", exist_ok=True)
+    anim.save(out_path, fps=24, dpi=200)
+    plt.close(fig)
+
+
+# =========================
+# Batch rendering
+# =========================
+
+def batch_render(
+    base_cfg: PlatformConfig,
+    variations: List[Dict[str, Any]],
+    out_dir: str,
+    name_pattern: str = "frame_{:03d}.png",
+) -> None:
+    os.makedirs(out_dir, exist_ok=True)
+    for idx, var in enumerate(variations):
+        kdict = asdict(base_cfg.kernel)
+        rdict = asdict(base_cfg.render)
+        for key, val in var.get("kernel", {}).items():
+            kdict[key] = val
+        for key, val in var.get("render", {}).items():
+            rdict[key] = val
+        cfg = PlatformConfig(kernel=KernelConfig(**kdict),
+                             render=RenderConfig(**rdict))
+        engine = PainFractalEngine(cfg.kernel)
+        field = engine.sample_field(cfg.render)
+        out_path = os.path.join(out_dir, name_pattern.format(idx))
+        save_field_image(field, cfg.render, out_path)
+
+
+# =========================
+# Minimal API
+# =========================
+
+def api_render_to_array(cfg: PlatformConfig) -> np.ndarray:
+    engine = PainFractalEngine(cfg.kernel)
+    return engine.sample_field(cfg.render)
+
+
+def api_render_to_png(cfg: PlatformConfig, out_path: str) -> None:
+    field = api_render_to_array(cfg)
+    save_field_image(field, cfg.render, out_path)
+
+
+# =========================
+# CLI commands
+# =========================
+
+def load_config_or_preset(
+    config_path: Optional[str],
+    preset: Optional[str],
+) -> PlatformConfig:
+    if config_path:
+        return PlatformConfig.from_json(config_path)
+    if preset:
+        if preset not in PRESETS:
+            raise ValueError(f"Unknown preset: {preset}")
+        return PRESETS[preset]
+    return PlatformConfig.default()
+
+
+def cmd_render(args: argparse.Namespace) -> None:
+    cfg = load_config_or_preset(args.config, args.preset)
+
+    if args.width:
+        cfg.render.width = args.width
+    if args.height:
+        cfg.render.height = args.height
+    if args.steps:
+        cfg.kernel.steps = args.steps
+    if args.cmap:
+        cfg.render.cmap = args.cmap
+
+    engine = PainFractalEngine(cfg.kernel)
+    field = engine.sample_field(cfg.render)
+
+    if args.output:
+        api_render_to_png(cfg, args.output)
+    if not args.no_show:
+        show_field(field, cfg.render)
+
+
+def cmd_dump_config(args: argparse.Namespace) -> None:
+    cfg = load_config_or_preset(None, args.preset or "default")
+    cfg.to_json(args.output)
+    print(f"Config written to {args.output}")
+
+
+def cmd_list_presets(args: argparse.Namespace) -> None:
+    print("Available presets:")
+    for name in PRESETS.keys():
+        print(" -", name)
+
+
+def cmd_batch(args: argparse.Namespace) -> None:
+    cfg = load_config_or_preset(args.config, args.preset)
+    variations: List[Dict[str, Any]] = []
+
+    # simple sweep over gain_core or nonlinearity
+    if args.sweep == "gain_core":
+        vals = np.linspace(args.start, args.end, args.count)
+        for v in vals:
+            variations.append({"kernel": {"gain_core": float(v)}})
+    elif args.sweep == "nonlinearity":
+        vals = np.linspace(args.start, args.end, args.count)
+        for v in vals:
+            variations.append({"kernel": {"nonlinearity": float(v)}})
+    else:
+        raise ValueError("Unsupported sweep parameter")
+
+    batch_render(cfg, variations, args.out_dir)
+
+
+def cmd_animate(args: argparse.Namespace) -> None:
+    cfg_a = load_config_or_preset(args.config_a, args.preset_a)
+    cfg_b = load_config_or_preset(args.config_b, args.preset_b)
+    animate_transition(cfg_a, cfg_b, args.frames, args.output)
+
+
+def build_parser() -> argparse.ArgumentParser:
+    p = argparse.ArgumentParser(
+        description="Pain Fractal Platform – Monolithic, Full Stack"
+    )
+    sub = p.add_subparsers(dest="cmd", required=True)
+
+    r = sub.add_parser("render", help="Render a single image")
+    r.add_argument("-c", "--config", type=str, help="JSON config file")
+    r.add_argument("-p", "--preset", type=str, help="Preset name")
+    r.add_argument("-o", "--output", type=str, help="Output PNG path")
+    r.add_argument("--width", type=int, help="Image width")
+    r.add_argument("--height", type=int, help="Image height")
+    r.add_argument("--steps", type=int, help="Max iteration steps")
+    r.add_argument("--cmap", type=str, help="Matplotlib colormap")
+    r.add_argument("--no-show", action="store_true", help="Do not display window")
+    r.set_defaults(func=cmd_render)
+
+    d = sub.add_parser("dump-config", help="Write config (from preset) to JSON")
+    d.add_argument("-p", "--preset", type=str, help="Preset name")
+    d.add_argument("-o", "--output", type=str, required=True, help="Config path")
+    d.set_defaults(func=cmd_dump_config)
+
+    lp = sub.add_parser("list-presets", help="List available presets")
+    lp.set_defaults(func=cmd_list_presets)
+
+    b = sub.add_parser("batch", help="Batch render parameter sweep")
+    b.add_argument("-c", "--config", type=str, help="JSON config file")
+    b.add_argument("-p", "--preset", type=str, help="Preset name")
+    b.add_argument("--sweep", type=str, choices=["gain_core", "nonlinearity"],
+                   required=True, help="Parameter to sweep")
+    b.add_argument("--start", type=float, required=True, help="Start value")
+    b.add_argument("--end", type=float, required=True, help="End value")
+    b.add_argument("--count", type=int, required=True, help="Number of frames")
+    b.add_argument("--out-dir", type=str, required=True, help="Output directory")
+    b.set_defaults(func=cmd_batch)
+
+    a = sub.add_parser("animate", help="Animate transition between two configs/presets")
+    a.add_argument("--config-a", type=str, help="JSON config A")
+    a.add_argument("--config-b", type=str, help="JSON config B")
+    a.add_argument("--preset-a", type=str, help="Preset A")
+    a.add_argument("--preset-b", type=str, help="Preset B")
+    a.add_argument("--frames", type=int, required=True, help="Number of frames")
+    a.add_argument("-o", "--output", type=str, required=True, help="Output video (e.g. mp4)")
+    a.set_defaults(func=cmd_animate)
+
+    return p
+
+
+def main() -> None:
+    parser = build_parser()
+    args = parser.parse_args()
+    args.func(args)
+
+
+if __name__ == "__main__":
+    main()
