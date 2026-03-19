@@ -1,2 +1,0 @@
-# metafractals
-meta fractals
